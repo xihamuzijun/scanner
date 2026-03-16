@@ -109,7 +109,7 @@ class ScannerConfig:
     output_points: int = 401
 
     # 本扫描仪与商业扫描仪之间的全局 x 原点偏移。
-    x_center_offset_mm: float = -10.0
+    x_center_offset_mm: float = -6.8
 
     random_state: int = 42
     test_size: float = 0.2
