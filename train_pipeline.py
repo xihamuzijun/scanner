@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 更新日志
+- v4
+    主脚本输出 layer1 横向几何校正与 layer2 映射训练的联合指标。
 - v3
 - v2
 - v1
@@ -55,13 +57,13 @@ def main() -> None:
 
     origin_pose = load_pose_npy(find_origin_pose_path(cfg.raw_root))
 
-    print("\n=== 1) 建立参考平面模型 ===")
+    print("\n=== 1) 建立参考平面与 layer1 横向几何校正 ===")
     plane_model = PlaneReferenceModel(cfg)
     plane_model.fit(layer1_dir, origin_pose)
     plane_model.save(os.path.join(cfg.model_dir, "plane_model.pkl"))
     print(f"[Save] 参考平面模型已保存到 {cfg.model_dir}")
 
-    print("\n=== 2) 建立纯图像 -> 轮廓映射模型 ===")
+    print("\n=== 2) 建立 layer2 纯图像 -> 轮廓映射模型 ===")
     mapping_model = ProfileMappingModel(cfg=cfg, plane_model=plane_model, origin_pose=origin_pose)
     mapping_metrics = mapping_model.fit(object_layer_dirs)
     mapping_model.save()
@@ -88,6 +90,8 @@ def main() -> None:
     print("\n=== 5) 核心结果 ===")
     print(f"验证集 MAE_dz = {mapping_metrics['mae_dz_mm']:.4f} mm")
     print(f"验证集 MAE_z  = {mapping_metrics['mae_z_mm']:.4f} mm")
+    print(f"layer1 x_shift 标签平均绝对值 = {plane_model.train_metrics.get('xshift_label_abs_mean_mm', float('nan')):.4f} mm")
+    print(f"layer1 x_shift 拟合 MAE      = {plane_model.train_metrics.get('xshift_fit_mae_mm', float('nan')):.4f} mm")
     print(summary_df.to_string(index=False))
 
 

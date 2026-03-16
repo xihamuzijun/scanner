@@ -1,6 +1,13 @@
 # -*- coding: utf-8 -*-
 """
 更新日志
+- v4
+    使用 layer1 训练得到的低自由度 x_shift 几何校正，再在 layer2 上学习局部残差。
+
+    关键改动：
+    1) 不再从 layer2 为每张图自由估计 x_shift；
+    2) prepare_sequence() 直接调用 plane_model.predict_x_shift()，将 layer1 学到的连续几何校正施加到所有 layer2 样本；
+    3) dz 映射模型仍在 layer2 上训练，但输入坐标系已经先经过几何校正。
 - v3
     纯图像 -> 轮廓映射模型。
 
@@ -20,7 +27,7 @@ from __future__ import annotations
 
 import hashlib
 import os
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import joblib
 import numpy as np
@@ -61,6 +68,7 @@ class ProfileMappingModel:
             min_samples_leaf=cfg.map_min_samples_leaf,
             random_state=cfg.random_state,
         )
+        self.fit_metrics: Dict[str, float] = {}
 
     def _cache_path(self, sample) -> str:
         ensure_dir(self.cfg.feature_cache_dir)
@@ -69,7 +77,7 @@ class ProfileMappingModel:
             f"{self.cfg.blur_ksize}|{self.cfg.global_threshold_percentile}|{self.cfg.min_peak_prominence}|"
             f"{self.cfg.min_valid_columns}|{self.cfg.context_halfwin}|{self.cfg.roi_x0}|{self.cfg.roi_x1}|"
             f"{self.cfg.roi_y0}|{self.cfg.roi_y1}|{self.cfg.full_image_width}|{self.cfg.full_image_height}|"
-            f"{self.cfg.physical_window_width_mm}|{self.cfg.x_center_offset_mm}"
+            f"{self.cfg.physical_window_width_mm}|{self.cfg.x_center_offset_mm}|{self.cfg.xshift_clip_mm}"
         )
         name = hashlib.md5(key.encode("utf-8")).hexdigest() + ".npz"
         return os.path.join(self.cfg.feature_cache_dir, name)
@@ -91,14 +99,17 @@ class ProfileMappingModel:
         np.savez_compressed(cache_path, **sample_npz)
         return sample_npz
 
-    def prepare_sequence(self, sample) -> Dict[str, np.ndarray]:
-        profile = self._extract_cached_profile(sample)
-        resampled = resample_observation(profile=profile, cfg=self.cfg)
+    def prepare_sequence(self, sample, profile: Optional[Dict[str, np.ndarray]] = None) -> Dict[str, np.ndarray]:
+        if profile is None:
+            profile = self._extract_cached_profile(sample)
+        image_width = int(np.asarray(profile["full_width"], dtype=np.float64).reshape(-1)[0])
+        x_shift_mm = self.plane_model.predict_x_shift(profile=profile, image_width=image_width)
+        resampled = resample_observation(profile=profile, cfg=self.cfg, x_shift_mm=x_shift_mm)
         x_rel_grid = np.asarray(resampled["x_rel_grid"], dtype=np.float64)
         z0_grid = self.plane_model.predict_curve(
             profile=profile,
             x_rel_grid_mm=x_rel_grid,
-            image_width=int(np.asarray(profile["full_width"], dtype=np.float64).reshape(-1)[0]),
+            image_width=image_width,
         )
         resampled["z0_grid"] = np.asarray(z0_grid, dtype=np.float64)
         feat = build_point_features(resampled, self.cfg)
@@ -106,15 +117,17 @@ class ProfileMappingModel:
             "feat": feat,
             "x_rel_grid": x_rel_grid,
             "z0_grid": z0_grid,
+            "x_shift_mm": float(x_shift_mm),
             "resampled": resampled,
         }
 
-    def build_training_dataset(self, layer_dirs: List[str]) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    def build_training_dataset(self, layer_dirs: List[str]) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         x_all = []
         y_dz_all = []
         z0_all = []
         z_true_all = []
         groups_all = []
+        shifts_all = []
 
         total_samples = 0
         used_samples = 0
@@ -137,7 +150,8 @@ class ProfileMappingModel:
                     continue
                 total_samples += 1
                 try:
-                    seq = self.prepare_sequence(sample)
+                    profile = self._extract_cached_profile(sample)
+                    seq = self.prepare_sequence(sample, profile=profile)
                     x_rel_grid = seq["x_rel_grid"]
                     z0_grid = seq["z0_grid"]
 
@@ -164,6 +178,7 @@ class ProfileMappingModel:
                     z0_all.append(z0_grid[keep].reshape(-1, 1))
                     z_true_all.append(z_true[keep].reshape(-1, 1))
                     groups_all.append(np.full((int(np.count_nonzero(keep)), 1), group_id, dtype=np.int64))
+                    shifts_all.append(float(seq["x_shift_mm"]))
 
                     layer_used += 1
                     used_samples += 1
@@ -185,11 +200,12 @@ class ProfileMappingModel:
         z0_all = np.vstack(z0_all).reshape(-1)
         z_true_all = np.vstack(z_true_all).reshape(-1)
         groups_all = np.vstack(groups_all).reshape(-1)
+        shifts_all = np.asarray(shifts_all, dtype=np.float64)
         print(f"[Data] 训练集构建完成：点数={x_all.shape[0]}，图像成功={used_samples}，图像跳过={skipped_samples}")
-        return x_all, y_dz_all, z0_all, z_true_all, groups_all
+        return x_all, y_dz_all, z0_all, z_true_all, groups_all, shifts_all
 
     def fit(self, layer_dirs: List[str]) -> Dict[str, float]:
-        x, y_dz, z0, z_true, groups = self.build_training_dataset(layer_dirs)
+        x, y_dz, z0, z_true, groups, shifts = self.build_training_dataset(layer_dirs)
         splitter = GroupShuffleSplit(
             n_splits=1,
             test_size=self.cfg.test_size,
@@ -212,22 +228,33 @@ class ProfileMappingModel:
         metrics = {
             "mae_dz_mm": float(mean_absolute_error(y_val, pred_dz)),
             "mae_z_mm": float(mean_absolute_error(z_true_val, pred_z)),
+            "xshift_pred_abs_mean_mm": float(np.mean(np.abs(shifts))) if shifts.size else 0.0,
+            "xshift_pred_mean_mm": float(np.mean(shifts)) if shifts.size else 0.0,
         }
+        self.fit_metrics = metrics
         print(f"[Model] 验证集 MAE_dz = {metrics['mae_dz_mm']:.4f} mm")
         print(f"[Model] 验证集 MAE_z  = {metrics['mae_z_mm']:.4f} mm")
+        print(
+            "[Model] 应用的 layer1 几何校正 x_shift："
+            f"abs mean={metrics['xshift_pred_abs_mean_mm']:.6f} mm，"
+            f"mean={metrics['xshift_pred_mean_mm']:.6f} mm"
+        )
         return metrics
 
     def predict_one_image(self, sample, output_mid_only: bool = True) -> pd.DataFrame:
-        seq = self.prepare_sequence(sample)
+        profile = self._extract_cached_profile(sample)
+        seq = self.prepare_sequence(sample, profile=profile)
         dz_pred = self.model_dz.predict(seq["feat"])
         z_pred = seq["z0_grid"] + dz_pred
 
         df_full = pd.DataFrame(
             {
                 "x_mm": seq["x_rel_grid"],
+                "x_nominal_mm": seq["resampled"]["x_rel_grid_nominal"],
                 "z_mm": z_pred,
                 "z0_mm": seq["z0_grid"],
                 "dz_pred_mm": dz_pred,
+                "x_shift_mm": np.full_like(seq["x_rel_grid"], seq["x_shift_mm"], dtype=np.float64),
             }
         )
         if not output_mid_only:
@@ -277,4 +304,5 @@ class ProfileMappingModel:
     def save(self) -> None:
         ensure_dir(self.cfg.model_dir)
         joblib.dump(self.model_dz, os.path.join(self.cfg.model_dir, "mapping_model.pkl"))
+        joblib.dump(self.fit_metrics, os.path.join(self.cfg.model_dir, "mapping_metrics.pkl"))
         print(f"[Save] 映射模型已保存到 {self.cfg.model_dir}")

@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 更新日志
+- v4
+    best x-shift 诊断统一改为读取配置范围，避免评估与训练使用不同的搜索边界。
 - v3
 - v2
     1) 评估改为 NaN 容忍：误差指标仅在有限值点上统计，不再因个别缺失点导致整条曲线指标为 NaN。
@@ -37,9 +39,6 @@ from data_reader import (
 from scanner_config import ScannerConfig
 
 
-# =========================
-# 基础工具函数
-# =========================
 def _finite_1d(arr: np.ndarray) -> np.ndarray:
     arr = np.asarray(arr, dtype=np.float64).reshape(-1)
     return arr[np.isfinite(arr)]
@@ -82,7 +81,6 @@ def _trapezoid(y: np.ndarray, x: np.ndarray) -> float:
 
 
 def _trapz_valid_segments(x: np.ndarray, y: np.ndarray) -> float:
-    """只在连续有效区段积分，避免跨 NaN 缺口直连。"""
     x = np.asarray(x, dtype=np.float64).reshape(-1)
     y = np.asarray(y, dtype=np.float64).reshape(-1)
     if x.size != y.size:
@@ -112,9 +110,6 @@ def _trapz_valid_segments(x: np.ndarray, y: np.ndarray) -> float:
     return float(total) if has_segment else np.nan
 
 
-# =========================
-# 诊断函数
-# =========================
 def _calc_centered_metrics(err: np.ndarray) -> Tuple[float, float]:
     err = _finite_1d(err)
     if err.size == 0:
@@ -131,10 +126,6 @@ def _shifted_profile_metrics(
     z_ref: np.ndarray,
     shift_mm: float,
 ) -> Tuple[float, float, int]:
-    """
-    用 z_ref(x + shift) 与 z_pred(x) 比较。
-    返回 (mae, rmse, valid_points)。
-    """
     x = np.asarray(x, dtype=np.float64).reshape(-1)
     z_pred = np.asarray(z_pred, dtype=np.float64).reshape(-1)
     z_ref = np.asarray(z_ref, dtype=np.float64).reshape(-1)
@@ -165,15 +156,13 @@ def _shifted_profile_metrics(
     return mae, rmse, int(err.size)
 
 
-def _find_best_shift(
-    x: np.ndarray,
-    z_pred: np.ndarray,
-    z_ref: np.ndarray,
-    shift_min_mm: float = -1.0,
-    shift_max_mm: float = 1.0,
-    step_mm: float = 0.05,
-) -> Dict[str, float]:
-    shifts = np.arange(shift_min_mm, shift_max_mm + 0.5 * step_mm, step_mm, dtype=np.float64)
+def _find_best_shift(cfg: ScannerConfig, x: np.ndarray, z_pred: np.ndarray, z_ref: np.ndarray) -> Dict[str, float]:
+    shifts = np.arange(
+        cfg.xshift_search_min_mm,
+        cfg.xshift_search_max_mm + 0.5 * cfg.xshift_search_step_mm,
+        cfg.xshift_search_step_mm,
+        dtype=np.float64,
+    )
 
     best_shift = np.nan
     best_mae = np.nan
@@ -198,9 +187,6 @@ def _find_best_shift(
     }
 
 
-# =========================
-# 单条曲线对比
-# =========================
 def compare_one_prediction(
     pred_csv_path: str,
     scanner_file: str,
@@ -244,10 +230,7 @@ def compare_one_prediction(
     return out
 
 
-# =========================
-# 单条曲线统计
-# =========================
-def summarize_compare_df(df: pd.DataFrame) -> Dict[str, float]:
+def summarize_compare_df(df: pd.DataFrame, cfg: ScannerConfig) -> Dict[str, float]:
     x = df["x_mm"].to_numpy(dtype=np.float64)
     z_pred = df["z_pred_mm"].to_numpy(dtype=np.float64)
     z_ref = df["z_ref_mm"].to_numpy(dtype=np.float64)
@@ -305,7 +288,7 @@ def summarize_compare_df(df: pd.DataFrame) -> Dict[str, float]:
     bias_mm = float(np.mean(err_valid))
     std_err_mm = float(np.std(err_valid))
     mae_centered_mm, rmse_centered_mm = _calc_centered_metrics(err_valid)
-    best_shift_info = _find_best_shift(x=x, z_pred=z_pred, z_ref=z_ref)
+    best_shift_info = _find_best_shift(cfg=cfg, x=x, z_pred=z_pred, z_ref=z_ref)
 
     base.update(
         {
@@ -322,9 +305,6 @@ def summarize_compare_df(df: pd.DataFrame) -> Dict[str, float]:
     return base
 
 
-# =========================
-# 遍历预测目录并生成单样本对比
-# =========================
 def compare_prediction_folder(cfg: ScannerConfig) -> Tuple[pd.DataFrame, List[str]]:
     ensure_dir(cfg.comparison_dir)
     origin_pose = load_pose_npy(find_origin_pose_path(cfg.raw_root))
@@ -371,7 +351,7 @@ def compare_prediction_folder(cfg: ScannerConfig) -> Tuple[pd.DataFrame, List[st
                 cmp_out = os.path.join(out_layer_dir, fname.replace("_mid20mm.csv", "_compare.csv"))
                 cmp_df.to_csv(cmp_out, index=False)
 
-                rec = summarize_compare_df(cmp_df)
+                rec = summarize_compare_df(cmp_df, cfg=cfg)
                 rec["scope"] = "by_layer"
                 rec["layer_id"] = layer_id
                 rec["sample_idx"] = sample_idx
@@ -386,9 +366,6 @@ def compare_prediction_folder(cfg: ScannerConfig) -> Tuple[pd.DataFrame, List[st
     return detail_df, failed
 
 
-# =========================
-# 汇总统计
-# =========================
 def build_summary(detail_df: pd.DataFrame) -> pd.DataFrame:
     if detail_df.empty:
         raise ValueError("detail_df 为空，无法汇总")
@@ -455,9 +432,6 @@ def build_summary(detail_df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-# =========================
-# CLI
-# =========================
 def main() -> None:
     parser = argparse.ArgumentParser(description="对预测结果与商业扫描仪真值进行对比")
     parser.add_argument("--raw-root", default="debug_data", help="原始数据目录")

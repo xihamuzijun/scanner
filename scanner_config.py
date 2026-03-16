@@ -1,6 +1,13 @@
 # -*- coding: utf-8 -*-
 """
 更新日志
+- v4
+    横向几何校正配置。
+
+    本版本将横向校正约束为低自由度、连续的 layer1 几何校正：
+    1) x_shift 标签仅从 layer1 平面样本估计，不再从 layer2 为每张图自由回归；
+    2) x_shift 搜索范围改为配置项，训练与评估共用同一套范围；
+    3) 新增低自由度 x_shift 拟合所需的多项式/裁剪参数。
 - v3
     扫描仪训练/预测统一配置。
 
@@ -72,16 +79,25 @@ class ScannerConfig:
     max_gap_fill_cols: int = 10
     min_valid_columns: int = 32
 
-    # 模型参数。
+    # 参考平面图像级标量模型。
     plane_max_iter: int = 250
     plane_max_depth: int = 6
     plane_learning_rate: float = 0.06
     plane_min_samples_leaf: int = 40
 
+    # 逐点 dz 映射模型。
     map_max_iter: int = 280
     map_max_depth: int = 8
     map_learning_rate: float = 0.06
     map_min_samples_leaf: int = 30
+
+    # layer1 几何校正：低自由度 x_shift 模型。
+    xshift_poly_degree: int = 2
+    xshift_ridge_alpha: float = 1.0
+    xshift_search_min_mm: float = -1.50
+    xshift_search_max_mm: float = 1.50
+    xshift_search_step_mm: float = 0.05
+    xshift_clip_mm: float = 1.50
 
     # 统一的网格设置。
     context_halfwin: int = 2
@@ -99,7 +115,7 @@ class ScannerConfig:
     test_size: float = 0.2
     log_every_n_samples: int = 100
 
-    cache_version: str = "v6_abs_u_grid_plane_curve_no_compat"
+    cache_version: str = "v7_abs_u_grid_plane_curve_layer1_xshift"
 
     @property
     def model_dir(self) -> str:
@@ -159,3 +175,6 @@ class ScannerConfig:
 
     def train_x_grid(self) -> np.ndarray:
         return self.full_u_to_x_mm(self.full_u_grid())
+
+    def clip_x_shift(self, shift_mm: float | np.ndarray) -> np.ndarray:
+        return np.clip(np.asarray(shift_mm, dtype=np.float64), -abs(self.xshift_clip_mm), abs(self.xshift_clip_mm))

@@ -1,14 +1,20 @@
 # -*- coding: utf-8 -*-
 """
 更新日志
+- v4
+    数据读取接口与主流程统一。
+
+    当前只保留一种真实数据组织：
+    - layer1/camera: 原始全图。训练/预测前按固定 ROI 截取，再恢复全图列坐标；
+    - layer2+/camera: 已手动替换好的固定 ROI 图。读取后只恢复偏移，不再二次裁剪。
+
+    本版本统一提供：
+    1) CameraSample dataclass；
+    2) build_meta_for_sample()；
+    3) attach_full_coordinates()；
+    4) sample_reference_profile() 只返回 z 值，和 v4 主流程保持一致。
 - v3
     数据读取与坐标元数据。
-
-    当前只支持一种数据组织：
-    - layer1/camera: 原始全图。训练/预测前按固定 ROI 截取，再恢复全图列坐标。
-    - layer2+/camera: 已经手动替换好的固定 ROI 图。读取后按固定 ROI 偏移恢复全图列坐标。
-
-    不再保留 camera_cropped、自动二次裁剪、旧兼容分支。
 - v2
     1) 增加方案A的数据读取接口：layer1使用原图+固定ROI信息，layer2+优读取裁剪后的图像。
     2) 增加图像/坐标元数据 dataclass，并支持将ROI内局部坐标恢复到原图全幅坐标。
@@ -73,7 +79,7 @@ def get_layer_id(layer_dir: str) -> int:
     return int(m.group(1))
 
 
-def read_gray(image_path: str) -> np.ndarray:
+def read_gray(image_path: str, cfg: ScannerConfig | None = None) -> np.ndarray:
     img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
     if img is None:
         raise FileNotFoundError(f"无法读取图像: {image_path}")

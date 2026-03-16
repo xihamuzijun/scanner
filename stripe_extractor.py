@@ -1,6 +1,13 @@
 # -*- coding: utf-8 -*-
 """
 更新日志
+- v4
+    重采样与逐点特征支持 layer1 几何校正输出的 x_shift。
+
+    关键改动：
+    1) resample_observation() 新增 x_shift_mm 输入，统一在物理 x 网格上施加横向平移；
+    2) 统计量中显式记录 x_shift_applied_mm；
+    3) build_point_features() 将 x_shift 作为全局特征加入逐点回归。
 - v3
 - v2
 - v1
@@ -45,26 +52,6 @@ MODE_TO_CODE = {
 }
 
 
-NUMERIC_INTERP_KEYS = [
-    "v",
-    "quality",
-    "mode_code",
-    "width_px",
-    "sigma_px",
-    "asymmetry",
-    "skewness",
-    "peak_val",
-    "intensity_sum",
-    "contrast",
-    "second_peak_ratio",
-    "saturation_ratio",
-    "centroid_offset_px",
-    "bg_mean",
-    "bg_std",
-    "snr",
-]
-
-
 GLOBAL_STAT_KEYS = [
     "u_left_actual",
     "u_right_actual",
@@ -82,6 +69,7 @@ GLOBAL_STAT_KEYS = [
     "peak_mean",
     "contrast_mean",
     "snr_mean",
+    "x_shift_applied_mm",
 ]
 
 
@@ -145,7 +133,6 @@ def _compute_local_background(col: np.ndarray, peak_idx: int, cfg: ScannerConfig
     if bg.size < 8:
         return float(np.median(col)), float(np.std(col) + 1e-6)
 
-    # 只用较暗的一部分样本估计背景，避免厚条纹肩部把背景抬高
     bg_sorted = np.sort(np.asarray(bg, dtype=np.float64))
     n_keep = max(8, int(cfg.bg_low_fraction * bg_sorted.size))
     bg_low = bg_sorted[:n_keep]
@@ -351,14 +338,15 @@ def extract_stripe_profile(img: np.ndarray, cfg: ScannerConfig) -> Dict[str, np.
         morph_full["snr"][u] = snr
         raw_valid[u] = mode != "invalid"
 
+    empty = {
+        "u": np.array([], dtype=np.float64),
+        "v": np.array([], dtype=np.float64),
+        "quality": np.array([], dtype=np.float64),
+        "mode_code": np.array([], dtype=np.float64),
+        **{k: np.array([], dtype=np.float64) for k in morph_full.keys()},
+    }
     if raw_valid.sum() < cfg.min_valid_columns:
-        return {
-            "u": np.array([], dtype=np.float64),
-            "v": np.array([], dtype=np.float64),
-            "quality": np.array([], dtype=np.float64),
-            "mode_code": np.array([], dtype=np.float64),
-            **{k: np.array([], dtype=np.float64) for k in morph_full.keys()},
-        }
+        return empty
 
     valid_for_cont = raw_valid & np.isfinite(center_full)
 
@@ -385,13 +373,7 @@ def extract_stripe_profile(img: np.ndarray, cfg: ScannerConfig) -> Dict[str, np.
 
     valid_idx = np.where(valid_for_cont & np.isfinite(center_full))[0]
     if valid_idx.size < cfg.min_valid_columns:
-        return {
-            "u": np.array([], dtype=np.float64),
-            "v": np.array([], dtype=np.float64),
-            "quality": np.array([], dtype=np.float64),
-            "mode_code": np.array([], dtype=np.float64),
-            **{k: np.array([], dtype=np.float64) for k in morph_full.keys()},
-        }
+        return empty
 
     result = {
         "u": valid_idx.astype(np.float64),
@@ -404,14 +386,11 @@ def extract_stripe_profile(img: np.ndarray, cfg: ScannerConfig) -> Dict[str, np.
     return result
 
 
-def resample_observation(profile: Dict[str, np.ndarray], cfg: ScannerConfig) -> Dict[str, np.ndarray]:
+def resample_observation(profile: Dict[str, np.ndarray], cfg: ScannerConfig, x_shift_mm: float = 0.0) -> Dict[str, np.ndarray]:
     """
     以固定 ROI 的全图列坐标为统一支撑网格，对观测条纹做重采样。
 
-    关键点：
-    1) 使用 u_full/v_full，而不是局部 u/v；
-    2) 输出显式的 x_rel_grid(mm)，不再把物理 x 当成隐含索引；
-    3) z0_grid 不在本函数内部生成，由上游参考平面模型补入。
+    当前版本在物理 x 网格上显式加入 layer1 几何校正输出的 x_shift_mm。
     """
     u_full = np.asarray(profile["u_full"], dtype=np.float64).reshape(-1)
     v_full = np.asarray(profile["v_full"], dtype=np.float64).reshape(-1)
@@ -427,8 +406,10 @@ def resample_observation(profile: Dict[str, np.ndarray], cfg: ScannerConfig) -> 
     v_full = v_full[idx]
     quality = quality[idx]
 
+    x_shift_mm = float(cfg.clip_x_shift(x_shift_mm))
     u_grid = cfg.full_u_grid()
-    x_rel_grid = cfg.full_u_to_x_mm(u_grid)
+    x_rel_grid_nominal = cfg.full_u_to_x_mm(u_grid)
+    x_rel_grid = x_rel_grid_nominal + x_shift_mm
     t_grid = np.linspace(-1.0, 1.0, cfg.profile_points, dtype=np.float64)
 
     actual_left = float(np.nanmin(u_full))
@@ -438,9 +419,11 @@ def resample_observation(profile: Dict[str, np.ndarray], cfg: ScannerConfig) -> 
 
     out: Dict[str, np.ndarray] = {
         "u_full_grid": u_grid,
+        "x_rel_grid_nominal": x_rel_grid_nominal,
         "x_rel_grid": x_rel_grid,
         "t_grid": t_grid,
         "valid_mask": valid_mask,
+        "x_shift_applied_mm": np.asarray([x_shift_mm], dtype=np.float64),
     }
 
     interp_data = {
@@ -462,8 +445,8 @@ def resample_observation(profile: Dict[str, np.ndarray], cfg: ScannerConfig) -> 
         "u_right_actual": actual_right,
         "u_span_actual": actual_span,
         "u_span_support": float(cfg.roi_u_right - cfg.roi_u_left),
-        "x_left_actual_mm": float(cfg.full_u_to_x_mm(actual_left)),
-        "x_right_actual_mm": float(cfg.full_u_to_x_mm(actual_right)),
+        "x_left_actual_mm": float(cfg.full_u_to_x_mm(actual_left) + x_shift_mm),
+        "x_right_actual_mm": float(cfg.full_u_to_x_mm(actual_right) + x_shift_mm),
         "x_span_actual_mm": float(cfg.full_u_to_x_mm(actual_right) - cfg.full_u_to_x_mm(actual_left)),
         "v_mean": float(np.nanmean(out["v_grid"])),
         "v_std": float(np.nanstd(out["v_grid"])),
@@ -474,6 +457,7 @@ def resample_observation(profile: Dict[str, np.ndarray], cfg: ScannerConfig) -> 
         "peak_mean": float(np.nanmean(out["peak_val_grid"])),
         "contrast_mean": float(np.nanmean(out["contrast_grid"])),
         "snr_mean": float(np.nanmean(out["snr_grid"])),
+        "x_shift_applied_mm": x_shift_mm,
     }
     out["stats"] = stats
     return out
@@ -486,12 +470,14 @@ def build_point_features(resampled: Dict[str, np.ndarray], cfg: ScannerConfig) -
     本版本显式加入：
     - u_full_grid / x_rel_grid：绝对列位置与物理 x；
     - z0_grid：逐列参考平面曲线，而非旧版常数基线；
+    - x_shift_applied_mm：layer1 几何校正输出的横向校正量；
     - 其余局部形貌特征及梯度。
     """
     t_grid = np.asarray(resampled["t_grid"], dtype=np.float64)
     x_rel_grid = np.asarray(resampled["x_rel_grid"], dtype=np.float64)
     u_full_grid = np.asarray(resampled["u_full_grid"], dtype=np.float64)
     valid_mask = np.asarray(resampled["valid_mask"], dtype=np.float64)
+    x_shift_applied_mm = float(np.asarray(resampled["x_shift_applied_mm"], dtype=np.float64).reshape(-1)[0])
 
     signal_names = [
         "v_grid",
@@ -524,6 +510,7 @@ def build_point_features(resampled: Dict[str, np.ndarray], cfg: ScannerConfig) -
     n = t_grid.size
     for i in range(n):
         j = i + pad
+        q_local = padded["quality_grid"][j - pad : j + pad + 1]
         f = [
             t_grid[i],
             valid_mask[i],
@@ -531,11 +518,13 @@ def build_point_features(resampled: Dict[str, np.ndarray], cfg: ScannerConfig) -
             x_rel_grid[i] / x_half,
             u_full_grid[i],
             (u_full_grid[i] - u_center) / u_half,
+            x_shift_applied_mm,
+            x_shift_applied_mm / max(abs(cfg.xshift_clip_mm), 1e-6),
         ]
         for name in signal_names:
             local = padded[name][j - pad : j + pad + 1]
             f.extend(local.tolist())
-            f.extend((local * padded["quality_grid"][j - pad : j + pad + 1]).tolist())
+            f.extend((local * q_local).tolist())
         for name in ("v_grid", "z0_grid", "quality_grid", "width_px_grid", "contrast_grid", "snr_grid"):
             f.extend(padded_grads[name][j - pad : j + pad + 1].tolist())
         f.extend(mask_pad[j - pad : j + pad + 1].tolist())
